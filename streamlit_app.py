@@ -1,151 +1,114 @@
-import streamlit as st
+# streamlit_app.py
+import numpy as np
 import pandas as pd
-import math
-from pathlib import Path
+import streamlit as st
+from pydantic import BaseModel, Field, ValidationError, validator
+from difflib import get_close_matches
+import logging
+import plotly.express as px
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Configura logging
+logging.basicConfig(level=logging.INFO, filename="predizioni.log",
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# ---------- Classe Input con Pydantic ----------
+class InputImmobiliare(BaseModel):
+    total_sqft: float = Field(gt=10, lt=10000)
+    bath: int = Field(ge=1, le=10)
+    balcony: int = Field(ge=0, le=5)
+    bhk: int = Field(ge=1, le=10)
+    location: str
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+    @validator("location")
+    def clean_location(cls, v):
+        return v.strip().lower().replace(" ", "_")
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+# ---------- Funzione di predizione ----------
+def predici_prezzo_immobile(input_data: InputImmobiliare, model, X_columns, default_location='centro', valuta='€'):
+    x_input = pd.DataFrame(np.zeros((1, len(X_columns))), columns=X_columns)
+    # Popola feature numeriche
+    for col in ['total_sqft', 'bath', 'balcony', 'bhk']:
+        if col in x_input.columns:
+            x_input[col] = getattr(input_data, col)
+    # Popola location
+    loc_col = 'location_' + input_data.location
+    valid_locations = [c for c in X_columns if c.startswith('location_')]
+    if loc_col in valid_locations:
+        x_input[loc_col] = 1
+    else:
+        matches = get_close_matches(loc_col, valid_locations, n=1)
+        if matches:
+            x_input[matches[0]] = 1
+            st.warning(f"Location '{input_data.location}' non trovata, usata '{matches[0][9:]}' per similarità.")
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            default_col = 'location_' + default_location
+            if default_col in valid_locations:
+                x_input[default_col] = 1
+                st.warning(f"Location '{input_data.location}' non trovata, usata fallback '{default_location}'.")
+            else:
+                raise ValueError(f"Location '{input_data.location}' e fallback '{default_location}' non valide.")
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    # Predizione con intervallo di confidenza se RandomForest
+    if hasattr(model, "estimators_"):
+        preds = np.array([tree.predict(x_input)[0] for tree in model.estimators_])
+        pred_mean = preds.mean()
+        pred_std = preds.std()
+        prezzo = round(pred_mean, -2)
+        logging.info(f"{input_data} -> {prezzo} ± {round(pred_std,2)}")
+        return prezzo, round(pred_std, 2)
+    else:
+        prezzo = round(model.predict(x_input)[0], -2)
+        logging.info(f"{input_data} -> {prezzo}")
+        return prezzo, None
+
+# ---------- Dummy Model per esempio ----------
+class DummyModel:
+    def predict(self, x):
+        # Genera predizione randomica intorno a 300k-800k per esempio
+        return [np.random.randint(300000, 800000)]
+
+# ---------- Streamlit UI ----------
+def main():
+    st.set_page_config(page_title="Predizione Prezzo Immobiliare", layout="wide")
+    st.title("🏠 Predizione Prezzo Immobiliare")
+    st.markdown("Inserisci le caratteristiche dell'immobile e calcola il prezzo stimato.")
+
+    # Input utente
+    col1, col2 = st.columns(2)
+    with col1:
+        total_sqft = st.slider("Superficie (m²)", 10, 10000, 90)
+        bath = st.number_input("Numero bagni", 1, 10, 2)
+        balcony = st.number_input("Numero balconi", 0, 5, 1)
+    with col2:
+        bhk = st.number_input("Numero stanze (BHK)", 1, 10, 3)
+        location = st.text_input("Location", "buccinasco")
+
+    # Colonne modello simulate
+    X_columns = ['total_sqft', 'bath', 'balcony', 'bhk',
+                 'location_centro', 'location_periferia', 'location_buccinasco']
+
+    # Modello dummy
+    model = DummyModel()
+
+    if st.button("Calcola prezzo"):
+        try:
+            input_data = InputImmobiliare(total_sqft=total_sqft, bath=bath, balcony=balcony, bhk=bhk, location=location)
+            prezzo, conf = predici_prezzo_immobile(input_data, model, X_columns)
+            st.success(f"💰 Prezzo stimato: €{prezzo:,.0f}")
+            if conf:
+                st.info(f"± intervallo di confidenza stimato: €{conf:,.0f}")
+        except ValidationError as ve:
+            st.error(f"Errore di validazione: {ve}")
+        except Exception as e:
+            st.error(f"Errore nella predizione: {e}")
+
+    # Grafico interattivo di esempio con Plotly
+    st.subheader("📊 Distribuzione Prezzi Simulata")
+    np.random.seed(42)
+    sample_prices = np.random.randint(200000, 1000000, size=100)
+    df_plot = pd.DataFrame({'Prezzo (€)': sample_prices})
+    fig = px.histogram(df_plot, x='Prezzo (€)', nbins=20, title="Distribuzione prezzi immobili (simulata)")
+    st.plotly_chart(fig, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
